@@ -2,21 +2,32 @@
 from __future__ import unicode_literals, print_function, division
 from io import open
 import unicodedata
-import string
-import re
-import random
-import SBT_encode
-import pickle
-import numpy
-from collections import Counter
+
 from torch.utils.data import Dataset, DataLoader
 import torch
 from torchvision import transforms
-
-import torch
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
+
+import pickle
+from collections import Counter
+import random
+import string
+import re
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+plt.switch_backend('agg')
+import matplotlib.ticker as ticker
+
+from SBT_encode import Encoder as CodeEncoder
+from comment_encode import Encoder as CommentEncoder
+
+
+torch.manual_seed(7)
+np.random.seed(7)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -33,49 +44,45 @@ else: # Otherwise, train on the CPU
 	extras = False
 	print("CUDA NOT supported")
 
-# SOS_token = 0
-# EOS_token = 1
 
-######################################################################
-# The Encoder
-# -----------
-#
-# The encoder of a seq2seq network is a RNN that outputs some value for
-# every word from the input sentence. For every input word the encoder
-# outputs a vector and a hidden state, and uses the hidden state for the
-# next input word.
-#
-# .. figure:: /_static/img/seq-seq-images/encoder-network.png
-#    :alt:
-#
-#
+# class CodeCommentDataset(Dataset):
+# 	def __init__(self, inputs, target):
+# 		self.inputs = inputs
+# 		self.target = target
 
-class codeCommentDataset(Dataset):
-	def __init__(self, inputs, target):
-		self.inputs = inputs
-		self.target = target
+# 	def __len__(self):
+# 		# Return the total number of data samples
+# 		return len(self.inputs)
+
+# 	def __getitem__(self, ind):
+# 		"""Returns one-hot encoded version of the target and labels
+# 		"""
+# 		data = self.inputs[ind]
+# 		label = self.target[ind]
+
+# 		return torch.LongTensor(data),torch.LongTensor(label)
+
+
+class CodeCommentDataset(Dataset):
+	def __init__(self, data):
+		self.comments, self.codes = zip(*data)
+		self.code_encoder = CodeEncoder()
+		self.comment_encoder = CommentEncoder()
 
 	def __len__(self):
 		# Return the total number of data samples
-		return len(self.inputs)
+		return len(self.comments)
 
 	def __getitem__(self, ind):
 		"""Returns one-hot encoded version of the target and labels
 		"""
-		data = self.inputs[ind]
-		label = self.target[ind]
+		return (torch.LongTensor(self.code_encoder.encode(self.codes[ind])),
+				torch.LongTensor(self.comment_encoder.encode(self.comments[ind])))
 
-		return torch.LongTensor(data),torch.LongTensor(label)
 
-def createLoaders(train_input, train_target, val_input, val_target, test_input, test_target, batch_size=1, extras={}):
+def createLoaders(batch_size=1, extras={}, debug=False):
 	# load training, validation and test text
-
-	# Convert into dataloader
-	train_dataset = codeCommentDataset(train_input, train_target)
-	val_dataset = codeCommentDataset(val_input, val_target)
-	test_dataset = codeCommentDataset(test_input, test_target)
-
-
+	print('-- create data loaders..')
 	num_workers = 0
 	pin_memory = False
 	# If CUDA is available
@@ -83,10 +90,18 @@ def createLoaders(train_input, train_target, val_input, val_target, test_input, 
 		num_workers = extras["num_workers"]
 		pin_memory = extras["pin_memory"]
 
-	train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
-	val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
-	test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
-	return train_dataloader, val_dataloader, test_dataloader
+	dataLoaders = {}
+	for phase in ['train', 'valid', 'test']:
+		with open('data/%s.pkl' % phase, 'rb') as f:
+			if debug:
+				dataset = CodeCommentDataset(pickle.load(f)[:10])
+			else:
+				dataset = CodeCommentDataset(pickle.load(f))
+		dataLoaders[phase] = DataLoader(dataset, batch_size=batch_size,
+												 num_workers=num_workers,
+												 pin_memory=pin_memory)
+	return dataLoaders
+
 
 class EncoderRNN(nn.Module):
 	def __init__(self, input_size, hidden_size):
@@ -105,33 +120,6 @@ class EncoderRNN(nn.Module):
 	def initHidden(self):
 		return torch.zeros(1, 1, self.hidden_size, device=device)
 
-######################################################################
-# The Decoder
-# -----------
-#
-# The decoder is another RNN that takes the encoder output vector(s) and
-# outputs a sequence of words to create the translation.
-#
-
-
-######################################################################
-# Simple Decoder
-# ^^^^^^^^^^^^^^
-#
-# In the simplest seq2seq decoder we use only last output of the encoder.
-# This last output is sometimes called the *context vector* as it encodes
-# context from the entire sequence. This context vector is used as the
-# initial hidden state of the decoder.
-#
-# At every step of decoding, the decoder is given an input token and
-# hidden state. The initial input token is the start-of-string ``<SOS>``
-# token, and the first hidden state is the context vector (the encoder's
-# last hidden state).
-#
-# .. figure:: /_static/img/seq-seq-images/decoder-network.png
-#    :alt:
-#
-#
 
 class DecoderRNN(nn.Module):
 	def __init__(self, hidden_size, output_size):
@@ -153,38 +141,6 @@ class DecoderRNN(nn.Module):
 	def initHidden(self):
 		return torch.zeros(1, 1, self.hidden_size, device=device)
 
-
-
-######################################################################
-# Attention Decoder
-# ^^^^^^^^^^^^^^^^^
-#
-# If only the context vector is passed betweeen the encoder and decoder,
-# that single vector carries the burden of encoding the entire sentence.
-#
-# Attention allows the decoder network to "focus" on a different part of
-# the encoder's outputs for every step of the decoder's own outputs. First
-# we calculate a set of *attention weights*. These will be multiplied by
-# the encoder output vectors to create a weighted combination. The result
-# (called ``attn_applied`` in the code) should contain information about
-# that specific part of the input sequence, and thus help the decoder
-# choose the right output words.
-#
-# .. figure:: https://i.imgur.com/1152PYf.png
-#    :alt:
-#
-# Calculating the attention weights is done with another feed-forward
-# layer ``attn``, using the decoder's input and hidden state as inputs.
-# Because there are sentences of all sizes in the training data, to
-# actually create and train this layer we have to choose a maximum
-# sentence length (input length, for encoder outputs) that it can apply
-# to. Sentences of the maximum length will use all the attention weights,
-# while shorter sentences will only use the first few.
-#
-# .. figure:: /_static/img/seq-seq-images/attention-decoder-network.png
-#    :alt:
-#
-#
 
 class AttnDecoderRNN(nn.Module):
 	def __init__(self, hidden_size, output_size, dropout_p=0.1):
@@ -225,100 +181,6 @@ class AttnDecoderRNN(nn.Module):
 		return torch.zeros(1, 1, self.hidden_size, device=device)
 
 
-######################################################################
-# .. note:: There are other forms of attention that work around the length
-#   limitation by using a relative position approach. Read about "local
-#   attention" in `Effective Approaches to Attention-based Neural Machine
-#   Translation <https://arxiv.org/abs/1508.04025>`__.
-#
-# Training
-# ========
-#
-# Preparing Training Data
-# -----------------------
-#
-# To train, for each pair we will need an input tensor (indexes of the
-# words in the input sentence) and target tensor (indexes of the words in
-# the target sentence). While creating these vectors we will append the
-# EOS token to both sequences.
-#
-
-
-######################################################################
-# Training the Model
-# ------------------
-#
-# To train we run the input sentence through the encoder, and keep track
-# of every output and the latest hidden state. Then the decoder is given
-# the ``<SOS>`` token as its first input, and the last hidden state of the
-# encoder as its first hidden state.
-#
-# "Teacher forcing" is the concept of using the real target outputs as
-# each next input, instead of using the decoder's guess as the next input.
-# Using teacher forcing causes it to converge faster but `when the trained
-# network is exploited, it may exhibit
-# instability <http://minds.jacobs-university.de/sites/default/files/uploads/papers/ESNTutorialRev.pdf>`__.
-#
-# You can observe outputs of teacher-forced networks that read with
-# coherent grammar but wander far from the correct translation -
-# intuitively it has learned to represent the output grammar and can "pick
-# up" the meaning once the teacher tells it the first few words, but it
-# has not properly learned how to create the sentence from the translation
-# in the first place.
-#
-# Because of the freedom PyTorch's autograd gives us, we can randomly
-# choose to use teacher forcing or not with a simple if statement. Turn
-# ``teacher_forcing_ratio`` up to use more of it.
-#
-
-
-def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, SOS_token=None):
-	encoder_hidden = encoder.initHidden()
-
-	encoder_optimizer.zero_grad()
-	decoder_optimizer.zero_grad()
-
-	input_length = input_tensor.size(0)
-	target_length = target_tensor.size(0)
-
-	encoder_outputs = torch.zeros(input_length, encoder.hidden_size, device=device)
-
-	loss = 0
-
-	for ei in range(input_length):
-		encoder_output, encoder_hidden = encoder(
-			input_tensor[ei], encoder_hidden)
-		encoder_outputs[ei] = encoder_output[0, 0]
-
-	decoder_input = torch.tensor([[SOS_token]], device=device)
-
-	decoder_hidden = encoder_hidden
-
-
-	# Teacher forcing: Feed the target as the next input
-	for di in range(target_length):
-		decoder_output, decoder_hidden, decoder_attention = decoder(
-			decoder_input, decoder_hidden, encoder_outputs)
-		loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
-		decoder_input = target_tensor[di]  # Teacher forcing
-
-	loss.backward()
-
-	encoder_optimizer.step()
-	decoder_optimizer.step()
-
-	return loss.item() / target_length
-
-
-######################################################################
-# This is a helper function to print time elapsed and estimated time
-# remaining given the current time and progress %.
-#
-
-import time
-import math
-
-
 def asMinutes(s):
 	m = math.floor(s / 60)
 	s -= m * 60
@@ -332,92 +194,6 @@ def timeSince(since, percent):
 	rs = es - s
 	return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
-
-######################################################################
-# The whole training process looks like this:
-#
-# -  Start a timer
-# -  Initialize optimizers and criterion
-# -  Create set of training pairs
-# -  Start empty losses array for plotting
-#
-# Then we call ``train`` many times and occasionally print the progress (%
-# of examples, time so far, estimated time) and average loss.
-#
-
-def preprocessing(file_name, type, comment_dict=None):
-	# load data
-	with open(file_name, 'rb') as f:
-		data = pickle.load(f)
-
-	comment = []
-	code = []
-	for i in range(len(data)):
-		temp_comment, temp_code = data[i]
-		comment.append(temp_comment)
-		code.append(temp_code)
-
-	pattern = r',|\.|/|;|\'|`|\[|\]|<|>|\?|:|"|\{|\}|\~|!|@|#|\$|%|\^|&|\(|\)|-|=|\_|\+|，|。|、|；|‘|’|【|】|·|！| |…|（|）'
-	# only when training
-	if comment_dict == None:
-		comment_wordlist = []
-		for i in range(len(comment)):
-			temp_list = re.split(pattern, comment[i])
-			for x in temp_list:
-				comment_wordlist.append(x)
-		c = Counter(comment_wordlist)
-		most_common_words, most_common_words_count = zip(*c.most_common(3000))
-		print('5 most common words:', most_common_words[:5])
-		print('5 most common words count', most_common_words_count[:5])
-		comment_dict = dict(zip(most_common_words, range(len(most_common_words))))
-		for token in ['<EOS>', '<SOS>', '<UNK>']:
-			assert(token not in comment_dict)
-			assert(max(comment_dict.values()) < len(comment_dict))
-			comment_dict[token] = len(comment_dict)
-
-		# temp_dict = {}
-		# for word in commment_wordlist:
-		# 	temp_dict[word] = commment_wordlist.count(word)
-		# temp_wordlist = sorted(temp_dict.items(), key=lambda kv: (-kv[1], kv[0]))[:3000]
-		# commment_wordlist = [temp_wordlist[i][0] for i in range(len(temp_wordlist))]
-
-		# comment_dict = dict(zip(commment_wordlist, range(3, len(commment_wordlist)+3)))
-		# comment_dict[SOS_token] = 'SOS'
-		# comment_dict[EOS_token] = 'EOS'
-		# comment_dict[2] = 'UNK'
-		# save dictionary
-		with open('data/comment_dict.pkl', 'wb') as pfile:
-			pickle.dump(comment_dict, pfile)
-
-	encoder = SBT_encode.Encoder()
-
-	code_in_num = []
-	comment_in_num = []
-
-	print('code encoding..')
-	for i in range(len(code)):
-		print(i, end='\r')
-		code_in_num.append(encoder.encode(code[i]))
-		# code_in_num[i].append(6903)
-                # already updated in Ecoder - chengyu
-	print('comment encoding..')
-	for i in range(len(comment)):
-		print(i, end='\r')
-		split_list = re.split(pattern, comment[i])
-		temp_list = []
-		temp_list.append(comment_dict['<SOS>'])
-		for x in split_list:
-			if x in comment_dict:
-				temp_list.append(comment_dict[x])
-			else: # unknown
-				temp_list.append(comment_dict['<UNK>'])
-		temp_list.append(comment_dict['<EOS>'])
-		comment_in_num.append(temp_list)
-	with open('data/' + type + '_code_in_num.pkl', 'wb') as pfile:
-		pickle.dump(code_in_num, pfile)
-	with open('data/' + type + '_comment_in_num.pkl', 'wb') as pfile:
-		pickle.dump(comment_in_num, pfile)
-	return code_in_num, comment_in_num, comment_dict
 
 # could also be use to test
 def validate_model(encoder, decoder, criterion, loader, SOS_token=None, device=None, verbose=False):
@@ -440,22 +216,69 @@ def validate_model(encoder, decoder, criterion, loader, SOS_token=None, device=N
 					input_tensor[ei], encoder_hidden)
 				encoder_outputs[ei] = encoder_output[0, 0]
 
-			decoder_input = torch.tensor([[SOS_token]], device=device)
-
+			# decoder_input = torch.tensor([[SOS_token]], device=device)
 			decoder_hidden = encoder_hidden
 
 			# Teacher forcing: Feed the target as the next input
 			for di in range(target_length):
+				decoder_input = target_tensor[di]  # Teacher forcing
 				decoder_output, decoder_hidden, decoder_attention = decoder(
 					decoder_input, decoder_hidden, encoder_outputs)
 				loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
-				decoder_input = target_tensor[di]  # Teacher forcing
+				# decoder_input = target_tensor[di]  # Teacher forcing
 			val_loss += loss.item() / target_length
 		print('Validation Loss: ', val_loss / len(loader))
 	return val_loss /len(loader)
 
+
+def train(input_tensor, target_tensor, encoder, decoder, 
+		  encoder_optimizer, decoder_optimizer, criterion,
+		  SOS_token=None):
+
+	encoder_hidden = encoder.initHidden()
+
+	encoder_optimizer.zero_grad()
+	decoder_optimizer.zero_grad()
+
+	input_length = input_tensor.size(0)
+	target_length = target_tensor.size(0)
+
+	encoder_outputs = torch.zeros(input_length, encoder.hidden_size, device=device)
+
+	loss = 0
+
+	for ei in range(input_length):
+		encoder_output, encoder_hidden = encoder(
+			input_tensor[ei], encoder_hidden)
+		encoder_outputs[ei] = encoder_output[0, 0]
+
+	# decoder_input = torch.tensor([[SOS_token]], device=device)
+
+	decoder_hidden = encoder_hidden
+
+
+	# Teacher forcing: Feed the target as the next input
+	for di in range(target_length):
+		decoder_input = target_tensor[di]  # Teacher forcing
+		decoder_output, decoder_hidden, decoder_attention = decoder(
+			decoder_input, decoder_hidden, encoder_outputs)
+		loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
+		# decoder_input = target_tensor[di]  # Teacher forcing
+
+	loss.backward()
+
+	encoder_optimizer.step()
+	decoder_optimizer.step()
+
+	return loss.item() / target_length
+
+
+def get_vocab_size(encoder):
+	return len(encoder.vocab_dict)
+
+
 def trainIters(learning_rate=0.001):
-	epochs = 15
+	epochs = 1
 	plot_train_losses = []
 	plot_val_losses = []
 	plot_loss_total = 0  # Reset every plot_every
@@ -467,63 +290,53 @@ def trainIters(learning_rate=0.001):
 		  '----------------'
 		  '' % (epochs, learning_rate, hidden_size))
 
-	criterion = nn.NLLLoss()
-	print('preprocessing..')
-	print('train set..')
-	train_code_in_num, train_comment_in_num, train_comment_dict = preprocessing('data/train.pkl', 'train')
-	print('val set..')
-	val_code_in_num, val_comment_in_num, train_comment_dict = preprocessing('data/valid.pkl', 'val', train_comment_dict)
-	print('test set..')
-	test_code_in_num, test_comment_in_num, train_comment_dict = preprocessing('data/test.pkl', 'test', train_comment_dict)
-	print('done..')
-	train_word_size_encoder = 6904
-	train_word_size_decoder = 3003
-	with open('data/train_code_in_num.pkl', 'rb') as pfile:
-		train_code_in_num = pickle.load(pfile)
-	with open('data/train_comment_in_num.pkl', 'rb') as pfile:
-		train_comment_in_num = pickle.load(pfile)
-	with open('data/val_code_in_num.pkl', 'rb') as pfile:
-		val_code_in_num = pickle.load(pfile)
-	with open('data/val_comment_in_num.pkl', 'rb') as pfile:
-		val_comment_in_num = pickle.load(pfile)
-	with open('data/test_code_in_num.pkl', 'rb') as pfile:
-		test_code_in_num = pickle.load(pfile)
-	with open('data/test_comment_in_num.pkl', 'rb') as pfile:
-		test_comment_in_num = pickle.load(pfile)
-	print('Data Loaded')
-
-	with open('data/comment_dict.pkl', 'rb') as pfile:
-		SOS_token = pickle.load(pfile)['<SOS>']
-
-	encoder = EncoderRNN(train_word_size_encoder, hidden_size).to(device)
-	# decoder = DecoderRNN(hidden_size, train_word_size_decoder).to(device)
-	decoder = AttnDecoderRNN(hidden_size, train_word_size_decoder, dropout_p=0.1).to(device)
+	# set model
+	vocab_size_encoder = get_vocab_size(CodeEncoder())
+	vocab_size_decoder = get_vocab_size(CommentEncoder())
+	print(vocab_size_encoder)
+	print(vocab_size_decoder)
+	print('----------------')
 	# COMMENT OUT WHEN FIRST TRAINING
 	# encoder, decoder = load_model()
+	encoder = EncoderRNN(vocab_size_encoder, hidden_size).to(device)
+	decoder = AttnDecoderRNN(hidden_size, vocab_size_decoder, dropout_p=0.1).to(device)
+
+	# set training hypers
+	criterion = nn.NLLLoss()
 	encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
 	decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
 
-	train_loader, val_loader, test_loader = createLoaders(train_code_in_num[:10000], train_comment_in_num[:10000], val_code_in_num[:500],
-														  val_comment_in_num[:500],test_code_in_num, test_comment_in_num,
-														  extras=extras)
+	# set data
+	dataLoaders = createLoaders(extras=extras, debug=True)
+
+	# used for initial input of decoder
+	# with open('dicts/comment_dict.pkl', 'rb') as pfile:
+	# 	SOS_token = pickle.load(pfile)['<SOS>']
+	# since we already prepend <SOS> to the comment, don't think need this in decoder model anymore
+	SOS_token = None
+
+	# iteration
 	counts = []
 	best_val_loss = 100
 	for eps in range(1, epochs + 1):
 		print('Epoch Number', eps)
-		for count, (inputs, targets) in enumerate(train_loader, 0):
+		for count, (inputs, targets) in enumerate(dataLoaders['train'], 0):
 			inputs = torch.LongTensor(inputs[0])
 			targets = torch.LongTensor(targets[0])
 			inputs, targets = inputs.to(device), targets.to(device)
 
-			loss = train(inputs, targets, encoder,
-							 decoder, encoder_optimizer, decoder_optimizer, criterion, SOS_token=SOS_token)
+			loss = train(inputs, targets,
+						 encoder, decoder,
+						 encoder_optimizer, decoder_optimizer,
+						 criterion, SOS_token=SOS_token)
 			plot_loss_total += loss
-			if count != 0 and count % 1000 == 0:
-				print(count, loss)
+			# if count != 0 and count % 10 == 0:
+			print(count, loss)
+
 		counts.append(eps)
-		plot_loss_avg = plot_loss_total / len(train_loader)
+		plot_loss_avg = plot_loss_total / len(dataLoaders['train'])
 		plot_train_losses.append(plot_loss_avg)
-		val_loss = validate_model(encoder, decoder, criterion, val_loader, SOS_token=SOS_token, device=device)
+		val_loss = validate_model(encoder, decoder, criterion, dataLoaders['valid'], SOS_token=SOS_token, device=device)
 		if val_loss < best_val_loss:
 			save_model(encoder, decoder)
 			best_val_loss = val_loss
@@ -532,11 +345,12 @@ def trainIters(learning_rate=0.001):
 		save_loss(plot_train_losses, plot_val_losses)
 	showPlot(counts, plot_train_losses, plot_val_losses)
 
+
 def save_model(encoder, decoder, type='attn'):
 	with open(type+'_encoder1.ckpt', 'wb') as pfile:
-		pickle.dump(encoder, pfile)
+		torch.save(encoder, pfile)
 	with open(type + '_decoder1.ckpt', 'wb') as pfile:
-		pickle.dump(decoder, pfile)
+		torch.save(decoder, pfile)
 
 def load_model(type='attn'):
 	with open(type+'_encoder.ckpt', 'rb') as pfile:
@@ -558,12 +372,6 @@ def save_loss(train_loss, val_loss):
 # Plotting is done with matplotlib, using the array of loss values
 # ``plot_losses`` saved while training.
 #
-
-import matplotlib.pyplot as plt
-plt.switch_backend('agg')
-import matplotlib.ticker as ticker
-import numpy as np
-
 
 def showPlot(iter, train_loss, val_loss):
 	plt.figure()

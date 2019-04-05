@@ -6,6 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
 import matplotlib.ticker as ticker
+
+
 class Generator:
     def __init__(self, encoder, decoder, comment_dict, SOS_token, EOS_token, device, max_length = 20):
         self.dict = {}
@@ -64,9 +66,9 @@ class Generator:
 
 def load_model(type='attn'):
     with open(type+'_encoder1.ckpt', 'rb') as pfile:
-        encoder = pickle.load(pfile)
+        encoder = torch.load(pfile)
     with open(type + '_decoder1.ckpt', 'rb') as pfile:
-        decoder = pickle.load(pfile)
+        decoder = torch.load(pfile)
     return encoder, decoder
 
 def showAttention(input_sentence, output_words, attentions):

@@ -148,7 +148,7 @@ def build_vocab(filename='data/train.pkl', name_vocab_length=2000):
 
     # save for frequent use
     name_vocab, _ = zip(*c_vocab.most_common())
-    with open('frequently_used_name.pkl', 'wb+') as f:
+    with open('dicts/frequently_used_name.pkl', 'wb+') as f:
         pickle.dump(name_vocab, f)
 
     # why do we have to do two traverse?
@@ -176,15 +176,15 @@ def build_vocab(filename='data/train.pkl', name_vocab_length=2000):
     # save for frequent use
     segs, _ = zip(*c.most_common())
     vocab_dict = dict(zip(segs, range(len(segs))))
-    with open('vocab_dict.pkl', 'wb+') as f:
+    with open('dicts/code_dict.pkl', 'wb+') as f:
         pickle.dump(vocab_dict, f)
 
 
 class Encoder():
     def __init__(self):
-        with open('vocab_dict.pkl', 'rb') as f:
+        with open('dicts/code_dict.pkl', 'rb') as f:
             self.vocab_dict = pickle.load(f)
-        with open('frequently_used_name.pkl', 'rb') as f:
+        with open('dicts/frequently_used_name.pkl', 'rb') as f:
             self.name_vocab = pickle.load(f)
         # append <EOS> to the dictionary
         assert('<EOS>' not in self.vocab_dict)
@@ -221,8 +221,8 @@ class Encoder():
 if __name__ == '__main__':
     # traverse the entire train set, build vocabulary for segments in sbt sequences
     # already built
-    # print('--- build vocab..')
-    # build_vocab()
+    print('--- build vocab..')
+    build_vocab()
 
     # check valid set
     # with open('data/valid.pkl', 'rb') as f:
@@ -240,7 +240,7 @@ if __name__ == '__main__':
     # for i, (_, code) in enumerate(test):
     #     print('test [%i]' % i, end='\r')
     #     encoder.decode(encoder.encode(code))
-    # print()
+    print()
 
     # encoding example
     # print('\n> Encode example:\n')
