@@ -4,6 +4,9 @@ Given a code snippet, generate comment automatically.
 
 Question & Answer pairs on Stackoverflow, python code only (Java code already experimented in [previous work](https://github.com/sriniiyer/codenn))
 
+### Preprocessing
+see [another repo](https://github.com/shwinshaker/Code2Comment-SBT)
+
 ### Model
 
 Sequence to sequence model with attention
