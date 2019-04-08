@@ -51,7 +51,7 @@ class Encoder():
     def __invert(self, d):
         return dict([(y,x) for x, y in d.items()])
 
-    def encode(self, comment): 
+    def encode(self, comment):
         comment_list = ['<SOS>']
         comment_list.extend(comment2list(comment))
         comment_list.append('<EOS>')
